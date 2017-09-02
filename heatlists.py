@@ -1,67 +1,65 @@
+import argparse
 import re
 import requests
 
 from bs4 import BeautifulSoup
-from pymongo import MongoClient
-
-URL = "http://dynadf.ca/LeChicDeLaDanse/lechic2016_HeatLists.htm"
-
-D_ID = "TABLE_CODE_(\d+)"
-P_NAME = "With (.+)"
-D_ID, P_NAME = (re.compile(x) for x in (D_ID, P_NAME))
-
-DTABLE = MongoClient().heatlists.dancers
+from collections import defaultdict
 
 
-def scrape(url=URL):
-
-    DTABLE.drop()
+def get_heats(url):
+    couples_per_heat = defaultdict(list)
+    heats_per_dancer = defaultdict(list)
 
     soup = BeautifulSoup(requests.get(url).text, "lxml")
+    for dancer in soup.find_all("div", {"id": re.compile("TABLE_CODE_\d+")}):
+        dancer_name = re.sub("Entries for ", "", dancer.find("strong").text)
 
-    for d_name, d_id in soup.find("table").select("tr"):
-        d_name = d_name.text
-        d_id, = D_ID.findall(d_id.input["onclick"])
-        DTABLE.save({"name": d_name, "_id": d_id})
-
-    for entries in soup.select("div[id^=TABLE_CODE]"):
-
-        d_id, = D_ID.findall(entries["id"])
-
-        for partner in entries.select("strong")[1:]:
-            if partner.text == "With ":
+        for partner in dancer.find_all("strong")[1:]:
+            partner_name = re.sub("With ", "", partner.text)
+            if dancer_name > partner_name:
                 continue
+            couple = (dancer_name, partner_name)
 
-            p_id = DTABLE.find_one({"name":
-                P_NAME.search(partner.text).group(1)})["_id"]
-            DTABLE.update({"_id": d_id}, {"$push": {"partners": p_id}})
+            heats = partner.find_next("table")
+            for heat in heats.find_all("tr")[1:]:
+                heat_data = [td.text for td in heat.find_all("td")]
+                heat_number, heat_name = heat_data[2:4]
+                heat_name = re.sub(" \([^)]+\)", "", heat_name)
+                couples_per_heat[(heat_number, heat_name)].append(couple)
 
-            for event in partner.find_next("table").select("tr")[1:]:
-                _, _, heat, title = event.select("td")
-                heat = "%s: %s" % (heat.text, title.text)
-                for _id in [d_id, p_id]:
-                    DTABLE.update({"_id": _id}, {"$push": {"heats": heat}})
+    for heat, couples in couples_per_heat.items():
+        for couple in couples:
+            for dancer in couple:
+                heats_per_dancer[dancer].append(heat)
+
+    return heats_per_dancer, couples_per_heat
 
 
-def get_heats(name):
+def normalize(name):
+    return " ".join(filter(None, name.split(", ")[::-1]))
 
-    def normalize(s):
-        return " ".join(reversed(s.split(", ")))
 
-    if not DTABLE.count():
-        scrape()
+def main(url, name):
+    heats_per_dancer, couples_per_heat = get_heats(url)
 
-    for heat in set(DTABLE.find_one({"name": name})["heats"]):
-        competitors = []
-        for competitor in DTABLE.find({"heats": {"$in": [heat]}}):
-            partner = DTABLE.find_one({
-                "_id": {"$in": competitor["partners"]},
-                    "heats": heat})
-            competitors.append([competitor["name"], partner["name"]])
-        competitors = [list(x) for x in set(map(frozenset, competitors))]
+    if name in heats_per_dancer:
+        for heat in sorted(heats_per_dancer[name]):
+            description = "%s: %s" % tuple(heat)
+            print(description)
+            print("=" * len(description))
 
-        print("\n" + heat)
-        print("===========================")
-        for couple in competitors:
-            print(" & ".join(map(normalize, couple)))
-        print()
+            for couple in couples_per_heat[heat]:
+                print(" & ".join(map(normalize, couple)))
+            print()
+    else:
+        print("Couldn't find dancer %s. Try a different spelling." % name)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", required=True, help="Heatlists URL")
+    parser.add_argument("--name", required=True,
+                        help="Lastname, Firstname in quotes (e.g. 'Bizokas, Arunas')")
+
+    args = parser.parse_args()
+    main(args.url, args.name)
